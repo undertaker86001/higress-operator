@@ -1,13 +1,21 @@
 package higressgateway
 
 import (
+	"context"
+	"fmt"
+
+	"github.com/go-logr/logr"
 	"k8s.io/api/autoscaling/v2"
 	"k8s.io/api/autoscaling/v2beta1"
 	"k8s.io/api/autoscaling/v2beta2"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/alibaba/higress/higress-operator/api/v1alpha1"
+	. "github.com/alibaba/higress/higress-operator/internal/controller"
 )
 
 func initHPAv2(hpa *v2.HorizontalPodAutoscaler, instance *v1alpha1.HigressGateway) *v2.HorizontalPodAutoscaler {
@@ -18,37 +26,82 @@ func initHPAv2(hpa *v2.HorizontalPodAutoscaler, instance *v1alpha1.HigressGatewa
 			Labels:      instance.Labels,
 			Annotations: instance.Annotations,
 		},
-		Spec: v2.HorizontalPodAutoscalerSpec{
-			MaxReplicas: instance.Spec.AutoScaling.MaxReplicas,
-			MinReplicas: instance.Spec.AutoScaling.MinReplicas,
-			ScaleTargetRef: v2.CrossVersionObjectReference{
-				Kind:       "Deployment",
-				Name:       instance.Name,
-				APIVersion: "apps/v1",
-			},
-			Metrics: []v2.MetricSpec{
-				{
-					Type: v2.ResourceMetricSourceType,
-					Resource: &v2.ResourceMetricSource{
-						Name: "cpu",
-						Target: v2.MetricTarget{
-							Type:               v2.UtilizationMetricType,
-							AverageUtilization: instance.Spec.AutoScaling.TargetCPUUtilizationPercentage,
-						},
-					},
-				},
-			},
-		},
 	}
+	updateHPAv2Spec(hpa, instance)
 
 	return hpa
 }
 
 func muteHPA(hpa *v2.HorizontalPodAutoscaler, instance *v1alpha1.HigressGateway) controllerutil.MutateFn {
 	return func() error {
-		initHPAv2(hpa, instance)
+		hpa.Labels = instance.Labels
+		hpa.Annotations = instance.Annotations
+		updateHPAv2Spec(hpa, instance)
 		return nil
 	}
+}
+
+func updateHPAv2Spec(hpa *v2.HorizontalPodAutoscaler, instance *v1alpha1.HigressGateway) {
+	hpa.Spec = v2.HorizontalPodAutoscalerSpec{
+		MaxReplicas: instance.Spec.AutoScaling.MaxReplicas,
+		MinReplicas: instance.Spec.AutoScaling.MinReplicas,
+		ScaleTargetRef: v2.CrossVersionObjectReference{
+			Kind:       "Deployment",
+			Name:       instance.Name,
+			APIVersion: "apps/v1",
+		},
+		Metrics: []v2.MetricSpec{
+			{
+				Type: v2.ResourceMetricSourceType,
+				Resource: &v2.ResourceMetricSource{
+					Name: "cpu",
+					Target: v2.MetricTarget{
+						Type:               v2.UtilizationMetricType,
+						AverageUtilization: instance.Spec.AutoScaling.TargetCPUUtilizationPercentage,
+					},
+				},
+			},
+		},
+	}
+}
+
+func (r *HigressGatewayReconciler) reconcileNativeHPA(
+	ctx context.Context,
+	instance *v1alpha1.HigressGateway,
+	logger logr.Logger,
+) error {
+	hpa := initHPAv2(&v2.HorizontalPodAutoscaler{}, instance)
+	if err := ctrl.SetControllerReference(instance, hpa, r.Scheme); err != nil {
+		return err
+	}
+
+	return CreateOrUpdate(ctx, r.Client, "HorizontalPodAutoscaler", hpa, muteHPA(hpa, instance), logger)
+}
+
+func (r *HigressGatewayReconciler) deleteNativeHPAIfExists(
+	ctx context.Context,
+	instance *v1alpha1.HigressGateway,
+	logger logr.Logger,
+) error {
+	hpa := &v2.HorizontalPodAutoscaler{}
+	key := types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, hpa); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if err := r.Delete(ctx, hpa); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	logger.Info(fmt.Sprintf("delete HorizontalPodAutoscaler for HigressGateway(%v)", instance.Name))
+	if r.Recorder != nil {
+		r.Recorder.Event(instance, "Normal", "NativeHPADeleted", "Deleted HorizontalPodAutoscaler")
+	}
+
+	return nil
 }
 
 func convertV2ToV2beta1(hpa *v2.HorizontalPodAutoscaler) (res *v2beta1.HorizontalPodAutoscaler) {

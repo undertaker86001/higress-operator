@@ -869,12 +869,46 @@ spec:
                 properties:
                   enable:
                     type: boolean
+                  keda:
+                    nullable: true
+                    properties:
+                      cooldownPeriodSeconds:
+                        format: int32
+                        type: integer
+                      idleReplicaCount:
+                        format: int32
+                        type: integer
+                      pollingIntervalSeconds:
+                        format: int32
+                        type: integer
+                      triggers:
+                        items:
+                          properties:
+                            authenticationRef:
+                              type: string
+                            metadata:
+                              additionalProperties:
+                                type: string
+                              type: object
+                            type:
+                              type: string
+                          required:
+                          - type
+                          type: object
+                        type: array
+                    type: object
                   maxReplicas:
                     format: int32
                     type: integer
                   minReplicas:
                     format: int32
                     type: integer
+                  mode:
+                    enum:
+                    - Disabled
+                    - NativeHPA
+                    - KEDA
+                    type: string
                   targetCPUUtilizationPercentage:
                     format: int32
                     type: integer
@@ -882,7 +916,6 @@ spec:
                 - enable
                 - maxReplicas
                 - minReplicas
-                - targetCPUUtilizationPercentage
                 type: object
               controller:
                 properties:

@@ -98,8 +98,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&higressgateway.HigressGatewayReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Recorder:   mgr.GetEventRecorderFor("higressgateway-controller"),
+		RESTMapper: mgr.GetRESTMapper(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "HigressGateway")
 		os.Exit(1)

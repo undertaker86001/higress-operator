@@ -873,12 +873,46 @@ spec:
                 properties:
                   enable:
                     type: boolean
+                  keda:
+                    nullable: true
+                    properties:
+                      cooldownPeriodSeconds:
+                        format: int32
+                        type: integer
+                      idleReplicaCount:
+                        format: int32
+                        type: integer
+                      pollingIntervalSeconds:
+                        format: int32
+                        type: integer
+                      triggers:
+                        items:
+                          properties:
+                            authenticationRef:
+                              type: string
+                            metadata:
+                              additionalProperties:
+                                type: string
+                              type: object
+                            type:
+                              type: string
+                          required:
+                          - type
+                          type: object
+                        type: array
+                    type: object
                   maxReplicas:
                     format: int32
                     type: integer
                   minReplicas:
                     format: int32
                     type: integer
+                  mode:
+                    enum:
+                    - Disabled
+                    - NativeHPA
+                    - KEDA
+                    type: string
                   targetCPUUtilizationPercentage:
                     format: int32
                     type: integer
@@ -886,7 +920,6 @@ spec:
                 - enable
                 - maxReplicas
                 - minReplicas
-                - targetCPUUtilizationPercentage
                 type: object
               enableHigressIstio:
                 type: boolean
@@ -900,6 +933,22 @@ spec:
                 type: object
               hostNetwork:
                 type: boolean
+              scheduling:
+                nullable: true
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  labels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  priorityClassName:
+                    type: string
+                  schedulerName:
+                    type: string
+                type: object
               image:
                 properties:
                   imagePullPolicy:
@@ -1869,10 +1918,18 @@ spec:
           status:
             description: HigressGatewayStatus defines the observed state of HigressGateway
             properties:
+              conditions:
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                type: array
               deployed:
                 type: boolean
-            required:
-            - deployed
+              effectiveScaleMode:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
             type: object
         type: object
     served: true

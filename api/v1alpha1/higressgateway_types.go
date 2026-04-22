@@ -42,11 +42,16 @@ type HigressGatewaySpec struct {
 	VolumeWasmPlugins []string `json:"volumeWasmPlugins"`
 	// +kubebuilder:validation:Optional
 	HostNetwork bool `json:"hostNetwork"`
+	// +kubebuilder:validation:Optional
+	Scheduling *SchedulingPolicy `json:"scheduling,omitempty"`
 }
 
 // HigressGatewayStatus defines the observed state of HigressGateway
 type HigressGatewayStatus struct {
-	Deployed bool `json:"deployed"`
+	Deployed           bool               `json:"deployed,omitempty"`
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	EffectiveScaleMode AutoScalingMode    `json:"effectiveScaleMode,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -78,6 +83,17 @@ type Skywalking struct {
 	Address string `json:"address"`
 	// +kubebuilder:validation:Optional
 	CustomBootStrap string `json:"customBootStrap"`
+}
+
+type SchedulingPolicy struct {
+	// +kubebuilder:validation:Optional
+	SchedulerName string `json:"schedulerName,omitempty"`
+	// +kubebuilder:validation:Optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+	// +kubebuilder:validation:Optional
+	Labels map[string]string `json:"labels,omitempty"`
+	// +kubebuilder:validation:Optional
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 type MeshConfig struct {

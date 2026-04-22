@@ -28,14 +28,19 @@ func initDeployment(deploy *appsv1.Deployment, instance *v1alpha1.HigressGateway
 		},
 	}
 
-	updateDeploymentSpec(deploy, instance)
+	updateDeploymentSpec(deploy, instance, shouldPreserveReplicas(instance))
 
 	return deploy
 }
 
-func updateDeploymentSpec(deploy *appsv1.Deployment, instance *v1alpha1.HigressGateway) *appsv1.Deployment {
+func updateDeploymentSpec(deploy *appsv1.Deployment, instance *v1alpha1.HigressGateway, preserveReplicas bool) *appsv1.Deployment {
+	replicas := instance.Spec.Replicas
+	if preserveReplicas && deploy.Spec.Replicas != nil {
+		replicas = deploy.Spec.Replicas
+	}
+
 	deploy.Spec = appsv1.DeploymentSpec{
-		Replicas: instance.Spec.Replicas,
+		Replicas: replicas,
 		Selector: &metav1.LabelSelector{
 			MatchLabels: instance.Spec.SelectorLabels,
 		},
@@ -47,16 +52,19 @@ func updateDeploymentSpec(deploy *appsv1.Deployment, instance *v1alpha1.HigressG
 		},
 		Template: apiv1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      instance.Name,
-				Namespace: instance.Namespace,
-				Labels:    instance.Spec.SelectorLabels,
+				Name:        instance.Name,
+				Namespace:   instance.Namespace,
+				Labels:      buildPodTemplateLabels(instance),
+				Annotations: buildPodTemplateAnnotations(instance),
 			},
 			Spec: apiv1.PodSpec{
-				ImagePullSecrets: instance.Spec.ImagePullSecrets,
-				SecurityContext:  genSecurityContextForPod(instance),
-				NodeSelector:     instance.Spec.NodeSelector,
-				Affinity:         instance.Spec.Affinity,
-				Tolerations:      instance.Spec.Toleration,
+				ImagePullSecrets:  instance.Spec.ImagePullSecrets,
+				SecurityContext:   genSecurityContextForPod(instance),
+				NodeSelector:      instance.Spec.NodeSelector,
+				Affinity:          instance.Spec.Affinity,
+				Tolerations:       instance.Spec.Toleration,
+				SchedulerName:     getSchedulerName(instance),
+				PriorityClassName: getPriorityClassName(instance),
 				Containers: []apiv1.Container{
 					{
 						Name:            instanceName,
@@ -93,9 +101,65 @@ func updateDeploymentSpec(deploy *appsv1.Deployment, instance *v1alpha1.HigressG
 	return deploy
 }
 
+func buildPodTemplateLabels(instance *v1alpha1.HigressGateway) map[string]string {
+	labels := copyStringMap(instance.Spec.SelectorLabels)
+	if instance.Spec.Scheduling == nil || len(instance.Spec.Scheduling.Labels) == 0 {
+		return labels
+	}
+
+	if labels == nil {
+		labels = make(map[string]string, len(instance.Spec.Scheduling.Labels))
+	}
+	for key, value := range instance.Spec.Scheduling.Labels {
+		if _, exists := labels[key]; exists {
+			continue
+		}
+		labels[key] = value
+	}
+
+	return labels
+}
+
+func buildPodTemplateAnnotations(instance *v1alpha1.HigressGateway) map[string]string {
+	if instance.Spec.Scheduling == nil {
+		return nil
+	}
+
+	return copyStringMap(instance.Spec.Scheduling.Annotations)
+}
+
+func getSchedulerName(instance *v1alpha1.HigressGateway) string {
+	if instance.Spec.Scheduling == nil {
+		return ""
+	}
+
+	return instance.Spec.Scheduling.SchedulerName
+}
+
+func getPriorityClassName(instance *v1alpha1.HigressGateway) string {
+	if instance.Spec.Scheduling == nil {
+		return ""
+	}
+
+	return instance.Spec.Scheduling.PriorityClassName
+}
+
+func copyStringMap(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+
+	return result
+}
+
 func muteDeployment(deploy *appsv1.Deployment, instance *v1alpha1.HigressGateway) controllerutil.MutateFn {
 	return func() error {
-		updateDeploymentSpec(deploy, instance)
+		updateDeploymentSpec(deploy, instance, shouldPreserveReplicas(instance))
 		return nil
 	}
 }

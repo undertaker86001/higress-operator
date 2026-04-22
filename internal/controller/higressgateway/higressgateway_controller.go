@@ -22,12 +22,17 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	apiv1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -39,17 +44,44 @@ import (
 
 const (
 	finalizer = "higressgateway.higress.io/finalizer"
+
+	conditionTypeReady              = "Ready"
+	conditionTypeConfigurationValid = "ConfigurationValid"
+	conditionTypeAutoscalingReady   = "AutoscalingReady"
+	conditionTypeDependencyReady    = "DependencyReady"
+
+	reasonValidationSucceeded   = "ValidationSucceeded"
+	reasonResourcesReady        = "ResourcesReady"
+	reasonConfigurationInvalid  = "ConfigurationInvalid"
+	reasonAutoscalingDisabled   = "AutoscalingDisabled"
+	reasonAutoscalingReady      = "AutoscalingReady"
+	reasonDependencyReady       = "DependencyReady"
+	reasonDependencyNotRequired = "NoExternalDependency"
+	reasonDependencyMissing     = "DependencyMissing"
 )
 
 // HigressGatewayReconciler reconciles a HigressGateway object
 type HigressGatewayReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	Recorder   record.EventRecorder
+	RESTMapper meta.RESTMapper
+}
+
+type validationError struct {
+	reason  string
+	message string
+}
+
+func (e *validationError) Error() string {
+	return e.message
 }
 
 //+kubebuilder:rbac:groups=operator.higress.io,resources=higressgateways,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=operator.higress.io,resources=higressgateways/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=operator.higress.io,resources=higressgateways/finalizers,verbs=update
+//+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 
 //+kubebuilder:rbac:groups="",resources=pods;services;services/finalizers;endpoints;persistentvolumeclaims;events;configmaps;secrets;serviceaccounts;namespaces,verbs=create;update;get;list;watch;patch;delete
 
@@ -113,6 +145,28 @@ func (r *HigressGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err = r.Update(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
+		if err = r.Get(ctx, req.NamespacedName, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.setDefaultValues(instance)
+	}
+
+	mode := getEffectiveScaleMode(instance)
+	if validationErr := validateAutoscalingConfig(instance); validationErr != nil {
+		logger.Error(validationErr, "Invalid HigressGateway autoscaling configuration", "name", req.NamespacedName)
+		if err = r.deleteNativeHPAIfExists(ctx, instance, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err = r.deleteKEDAScaledObjectIfExists(ctx, instance, logger); err != nil && !meta.IsNoMatchError(err) {
+			return ctrl.Result{}, err
+		}
+		r.recordValidationFailure(instance, validationErr)
+		if err = r.patchStatus(ctx, instance, func(status *operatorv1alpha1.HigressGatewayStatus) {
+			markConfigurationInvalid(status, instance.Generation, mode, validationErr)
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
 	if err = r.createServiceAccount(ctx, instance, logger); err != nil {
@@ -131,15 +185,78 @@ func (r *HigressGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
+	autoscalingConditionStatus := metav1.ConditionTrue
+	autoscalingConditionReason := reasonAutoscalingDisabled
+	autoscalingConditionMessage := "Autoscaling is disabled"
+	dependencyConditionStatus := metav1.ConditionTrue
+	dependencyConditionReason := reasonDependencyNotRequired
+	dependencyConditionMessage := "No external autoscaling dependency is required"
+
+	switch mode {
+	case operatorv1alpha1.AutoScalingModeDisabled:
+		if err = r.deleteNativeHPAIfExists(ctx, instance, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err = r.deleteKEDAScaledObjectIfExists(ctx, instance, logger); err != nil && !meta.IsNoMatchError(err) {
+			return ctrl.Result{}, err
+		}
+	case operatorv1alpha1.AutoScalingModeNativeHPA:
+		if err = r.deleteKEDAScaledObjectIfExists(ctx, instance, logger); err != nil && !meta.IsNoMatchError(err) {
+			return ctrl.Result{}, err
+		}
+		if err = r.reconcileNativeHPA(ctx, instance, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+		autoscalingConditionReason = reasonAutoscalingReady
+		autoscalingConditionMessage = "Native HPA reconciled successfully"
+	case operatorv1alpha1.AutoScalingModeKEDA:
+		if err = r.deleteNativeHPAIfExists(ctx, instance, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+		installed, mappingErr := r.isKEDACRDInstalled(ctx)
+		if mappingErr != nil {
+			return ctrl.Result{}, mappingErr
+		}
+		if !installed {
+			autoscalingConditionStatus = metav1.ConditionFalse
+			autoscalingConditionReason = reasonDependencyMissing
+			autoscalingConditionMessage = "KEDA ScaledObject cannot be reconciled because the KEDA CRD is not installed"
+			dependencyConditionStatus = metav1.ConditionFalse
+			dependencyConditionReason = reasonDependencyMissing
+			dependencyConditionMessage = "KEDA CRD is not installed in the cluster"
+		} else {
+			if err = r.reconcileKEDAScaledObject(ctx, instance, logger); err != nil {
+				return ctrl.Result{}, err
+			}
+			autoscalingConditionReason = reasonAutoscalingReady
+			autoscalingConditionMessage = "KEDA ScaledObject reconciled successfully"
+			dependencyConditionReason = reasonDependencyReady
+			dependencyConditionMessage = "KEDA CRD is available"
+		}
+	}
+
 	if err = r.createService(ctx, instance, logger); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if !instance.Status.Deployed {
-		instance.Status.Deployed = true
-		if err = r.Status().Update(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err = r.patchStatus(ctx, instance, func(status *operatorv1alpha1.HigressGatewayStatus) {
+		markResourcesReady(status, instance.Generation, mode)
+		setAutoscalingCondition(
+			status,
+			instance.Generation,
+			autoscalingConditionStatus,
+			autoscalingConditionReason,
+			autoscalingConditionMessage,
+		)
+		setDependencyCondition(
+			status,
+			instance.Generation,
+			dependencyConditionStatus,
+			dependencyConditionReason,
+			dependencyConditionMessage,
+		)
+	}); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
@@ -150,6 +267,7 @@ func (r *HigressGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&operatorv1alpha1.HigressGateway{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Owns(&apiv1.Service{}).
 		Owns(&apiv1.ConfigMap{}).
 		Owns(&apiv1.ServiceAccount{}).
@@ -330,4 +448,215 @@ func (r *HigressGatewayReconciler) setDefaultValues(instance *operatorv1alpha1.H
 	if instance.Spec.Skywalking == nil {
 		instance.Spec.Skywalking = &operatorv1alpha1.Skywalking{Enable: false}
 	}
+}
+
+func shouldPreserveReplicas(instance *operatorv1alpha1.HigressGateway) bool {
+	return getEffectiveScaleMode(instance) != operatorv1alpha1.AutoScalingModeDisabled
+}
+
+func getEffectiveScaleMode(instance *operatorv1alpha1.HigressGateway) operatorv1alpha1.AutoScalingMode {
+	if instance.Spec.AutoScaling == nil || !instance.Spec.AutoScaling.Enable {
+		return operatorv1alpha1.AutoScalingModeDisabled
+	}
+
+	if instance.Spec.AutoScaling.Mode != "" {
+		return instance.Spec.AutoScaling.Mode
+	}
+	if instance.Spec.AutoScaling.KEDA != nil {
+		return operatorv1alpha1.AutoScalingModeKEDA
+	}
+
+	return operatorv1alpha1.AutoScalingModeNativeHPA
+}
+
+func validateAutoscalingConfig(instance *operatorv1alpha1.HigressGateway) *validationError {
+	if getEffectiveScaleMode(instance) == operatorv1alpha1.AutoScalingModeDisabled {
+		return nil
+	}
+
+	if instance.Spec.Local {
+		return &validationError{
+			reason:  "LocalModeUnsupported",
+			message: "autoscaling cannot be enabled when spec.local=true",
+		}
+	}
+
+	as := instance.Spec.AutoScaling
+	if as.MinReplicas != nil && as.MaxReplicas < *as.MinReplicas {
+		return &validationError{
+			reason:  "InvalidReplicaBounds",
+			message: "spec.autoScaling.maxReplicas must be greater than or equal to spec.autoScaling.minReplicas",
+		}
+	}
+
+	switch getEffectiveScaleMode(instance) {
+	case operatorv1alpha1.AutoScalingModeNativeHPA:
+		if as.TargetCPUUtilizationPercentage == nil {
+			return &validationError{
+				reason:  "MissingCPUTarget",
+				message: "spec.autoScaling.targetCPUUtilizationPercentage is required when autoscaling mode is NativeHPA",
+			}
+		}
+
+		if instance.Spec.Resources == nil || instance.Spec.Resources.Requests == nil {
+			return &validationError{
+				reason:  "MissingCPURequest",
+				message: "spec.resources.requests.cpu is required when autoscaling mode is NativeHPA",
+			}
+		}
+
+		cpuRequest, ok := instance.Spec.Resources.Requests[apiv1.ResourceCPU]
+		if !ok || cpuRequest.IsZero() {
+			return &validationError{
+				reason:  "MissingCPURequest",
+				message: "spec.resources.requests.cpu is required when autoscaling mode is NativeHPA",
+			}
+		}
+	case operatorv1alpha1.AutoScalingModeKEDA:
+		if as.KEDA == nil {
+			return &validationError{
+				reason:  "MissingKEDAConfig",
+				message: "spec.autoScaling.keda is required when autoscaling mode is KEDA",
+			}
+		}
+		if len(as.KEDA.Triggers) == 0 {
+			return &validationError{
+				reason:  "MissingKEDATriggers",
+				message: "spec.autoScaling.keda.triggers must contain at least one trigger when autoscaling mode is KEDA",
+			}
+		}
+		for _, trigger := range as.KEDA.Triggers {
+			if trigger.Type == "" {
+				return &validationError{
+					reason:  "InvalidKEDATrigger",
+					message: "spec.autoScaling.keda.triggers.type must not be empty",
+				}
+			}
+		}
+	default:
+		return &validationError{
+			reason:  "UnsupportedAutoscalingMode",
+			message: fmt.Sprintf("unsupported autoscaling mode %q", getEffectiveScaleMode(instance)),
+		}
+	}
+
+	return nil
+}
+
+func markConfigurationInvalid(
+	status *operatorv1alpha1.HigressGatewayStatus,
+	generation int64,
+	mode operatorv1alpha1.AutoScalingMode,
+	validationErr *validationError,
+) {
+	status.Deployed = false
+	status.ObservedGeneration = generation
+	status.EffectiveScaleMode = mode
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeConfigurationValid,
+		Status:             metav1.ConditionFalse,
+		Reason:             validationErr.reason,
+		Message:            validationErr.message,
+		ObservedGeneration: generation,
+	})
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonConfigurationInvalid,
+		Message:            validationErr.message,
+		ObservedGeneration: generation,
+	})
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeAutoscalingReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonConfigurationInvalid,
+		Message:            validationErr.message,
+		ObservedGeneration: generation,
+	})
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeDependencyReady,
+		Status:             metav1.ConditionUnknown,
+		Reason:             reasonConfigurationInvalid,
+		Message:            validationErr.message,
+		ObservedGeneration: generation,
+	})
+}
+
+func markResourcesReady(
+	status *operatorv1alpha1.HigressGatewayStatus,
+	generation int64,
+	mode operatorv1alpha1.AutoScalingMode,
+) {
+	status.Deployed = true
+	status.ObservedGeneration = generation
+	status.EffectiveScaleMode = mode
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeConfigurationValid,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonValidationSucceeded,
+		Message:            "HigressGateway configuration is valid",
+		ObservedGeneration: generation,
+	})
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeReady,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonResourcesReady,
+		Message:            "HigressGateway resources reconciled successfully",
+		ObservedGeneration: generation,
+	})
+}
+
+func setAutoscalingCondition(
+	status *operatorv1alpha1.HigressGatewayStatus,
+	generation int64,
+	conditionStatus metav1.ConditionStatus,
+	reason, message string,
+) {
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeAutoscalingReady,
+		Status:             conditionStatus,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: generation,
+	})
+}
+
+func setDependencyCondition(
+	status *operatorv1alpha1.HigressGatewayStatus,
+	generation int64,
+	conditionStatus metav1.ConditionStatus,
+	reason, message string,
+) {
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionTypeDependencyReady,
+		Status:             conditionStatus,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: generation,
+	})
+}
+
+func (r *HigressGatewayReconciler) patchStatus(
+	ctx context.Context,
+	instance *operatorv1alpha1.HigressGateway,
+	mutate func(status *operatorv1alpha1.HigressGatewayStatus),
+) error {
+	base := instance.DeepCopy()
+	mutate(&instance.Status)
+	if equality.Semantic.DeepEqual(base.Status, instance.Status) {
+		return nil
+	}
+
+	return r.Status().Patch(ctx, instance, client.MergeFrom(base))
+}
+
+func (r *HigressGatewayReconciler) recordValidationFailure(
+	instance *operatorv1alpha1.HigressGateway,
+	validationErr *validationError,
+) {
+	if r.Recorder == nil {
+		return
+	}
+
+	r.Recorder.Event(instance, apiv1.EventTypeWarning, validationErr.reason, validationErr.message)
 }

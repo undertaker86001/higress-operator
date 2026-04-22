@@ -3,11 +3,11 @@ kind: HigressGateway
 metadata:
   labels:
     app.kubernetes.io/name: higressgateway
-    app.kubernetes.io/instance: higressgateway-sample
+    app.kubernetes.io/instance: higressgateway-keda-sample
     app.kubernetes.io/part-of: higressoperator
     app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/created-by: higressoperator
-  name: higress-gateway
+  name: higress-gateway-keda
   namespace: higress-system
 spec:
   enableStatus: true
@@ -24,18 +24,19 @@ spec:
       memory: "512Mi"
   autoScaling:
     enable: true
-    mode: NativeHPA
+    mode: KEDA
     minReplicas: 1
-    maxReplicas: 5
-    targetCPUUtilizationPercentage: 80
-  scheduling:
-    schedulerName: default-scheduler
-    labels:
-      workload-class: online-gateway
-    annotations:
-      koordinator.sh/qosClass: LS
-    # Replace with an existing PriorityClass in your cluster when needed.
-    # priorityClassName: higress-online-high
+    maxReplicas: 10
+    keda:
+      pollingIntervalSeconds: 30
+      cooldownPeriodSeconds: 300
+      triggers:
+      - type: prometheus
+        metadata:
+          serverAddress: "http://prometheus.monitoring.svc:9090"
+          metricName: "higress_active_connections"
+          query: "sum(envoy_http_downstream_cx_active{namespace=\"higress-system\"}) or vector(0)"
+          threshold: "50"
   rollingMaxSurge: 100%
   rollingMaxUnavailable: 25%
   meshConfig:
@@ -54,4 +55,4 @@ spec:
       disableAlpnH2: true
       proxyStatsMatcher:
         inclusionRegexps:
-          - ".*"
+        - ".*"

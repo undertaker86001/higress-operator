@@ -99,11 +99,50 @@ type ServiceAccount struct {
 
 // +k8s:deepcopy-gen=true
 
+type AutoScalingMode string
+
+const (
+	AutoScalingModeDisabled  AutoScalingMode = "Disabled"
+	AutoScalingModeNativeHPA AutoScalingMode = "NativeHPA"
+	AutoScalingModeKEDA      AutoScalingMode = "KEDA"
+)
+
+// +k8s:deepcopy-gen=true
+
 type AutoScaling struct {
-	Enable                         bool   `json:"enable"`
-	MinReplicas                    *int32 `json:"minReplicas"`
-	MaxReplicas                    int32  `json:"maxReplicas"`
-	TargetCPUUtilizationPercentage *int32 `json:"targetCPUUtilizationPercentage"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=Disabled;NativeHPA;KEDA
+	Mode                           AutoScalingMode `json:"mode,omitempty"`
+	Enable                         bool            `json:"enable"`
+	MinReplicas                    *int32          `json:"minReplicas"`
+	MaxReplicas                    int32           `json:"maxReplicas"`
+	TargetCPUUtilizationPercentage *int32          `json:"targetCPUUtilizationPercentage"`
+	// +kubebuilder:validation:Optional
+	// +nullable
+	KEDA *KEDAScalingConfig `json:"keda,omitempty"`
+}
+
+// +k8s:deepcopy-gen=true
+
+type KEDAScalingConfig struct {
+	// +kubebuilder:validation:Optional
+	PollingIntervalSeconds *int32 `json:"pollingIntervalSeconds,omitempty"`
+	// +kubebuilder:validation:Optional
+	CooldownPeriodSeconds *int32 `json:"cooldownPeriodSeconds,omitempty"`
+	// +kubebuilder:validation:Optional
+	IdleReplicaCount *int32 `json:"idleReplicaCount,omitempty"`
+	// +kubebuilder:validation:Optional
+	Triggers []KEDAScaleTrigger `json:"triggers,omitempty"`
+}
+
+// +k8s:deepcopy-gen=true
+
+type KEDAScaleTrigger struct {
+	Type string `json:"type"`
+	// +kubebuilder:validation:Optional
+	Metadata map[string]string `json:"metadata,omitempty"`
+	// +kubebuilder:validation:Optional
+	AuthenticationRef *string `json:"authenticationRef,omitempty"`
 }
 
 // +k8s:deepcopy-gen=true
